@@ -1,129 +1,129 @@
 """
-Script pour récupérer la température du ventilateur Dyson 
-et l'écrire dans Google Sheets toutes les 30 minutes.
+Dyson Temperature Logger → Google Sheets
+Récupère la température du ventilateur Dyson toutes les 30 minutes
+et l'écrit dans Google Sheets avec horodatage.
 """
 
 from libpurecool.dyson import DysonAccount
 import gspread
-from google.auth.service_account import ServiceAccountCredentials
-from datetime import datetime
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timezone
 import os
-import time
 import json
+import time
 
-# --- Configuration Dyson ---
-DYSON_EMAIL = os.environ['DYSON_EMAIL']
-DYSON_PASSWORD = os.environ['DYSON_PASSWORD']
-DYSON_LANGUAGE = 'FR'  # Code langue à ajuster (FR, EN, ES, etc.)
 
-# --- Configuration Google Sheets ---
+# --- Configuration Dyson (via secrets GitHub) ---
+DYSON_EMAIL = os.environ["DYSON_EMAIL"]
+DYSON_PASSWORD = os.environ["DYSON_PASSWORD"]
+DYSON_LANGUAGE = "FR"  # Code langue: FR, EN, ES, etc.
+
+
+# --- Configuration Google Sheets (via secrets GitHub) ---
 GOOGLE_SHEET_NAME = os.environ["GOOGLE_SHEET_NAME"]
-WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "test")
+WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "Feuille1")
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 
 def get_dyson_temperature():
-    """Se connecter au Dyson et récupérer la température intérieure en °C."""
+    """
+    Se connecter au compte Dyson et récupérer la température intérieure en °C.
+    Retourne la température en Celsius (float) ou lève une exception en cas d'erreur.
+    """
     print("Connexion au compte Dyson...")
-    dyson_account = DysonAccount(DYSON_EMAIL, DYSON_PASSWORD, DYSON_LANGUAGE)
-    logged = dyson_account.login()
+    account = DysonAccount(DYSON_EMAIL, DYSON_PASSWORD, DYSON_LANGUAGE)
     
-    if not logged:
-        print("Erreur: Impossible de se connecter au compte Dyson")
-        return None
+    if not account.login():
+        raise RuntimeError("Connexion au compte Dyson impossible")
     
-    devices = dyson_account.devices()
+    devices = account.devices()
     
     if not devices:
-        print("Erreur: Aucun appareil Dyson trouvé sur ce compte")
-        dyson_account.logout()
-        return None
+        account.logout()
+        raise RuntimeError("Aucun appareil Dyson trouvé sur ce compte")
     
     print(f"{len(devices)} appareil(s) Dyson trouvé(s)")
     
-    device = devices[0]
-    connected = device.auto_connect()
+    device = devices[0]  # Premier appareil (adaptez si besoin)
     
-    if not connected:
-        print("Erreur: Impossible de se connecter au dispositif Dyson")
-        dyson_account.logout()
-        return None
+    if not device.auto_connect():
+        account.logout()
+        raise RuntimeError("Connexion à l'appareil Dyson impossible")
     
-    time.sleep(3)  # Attendre les données des capteurs
+    # Attendre que les données des capteurs soient disponibles
+    time.sleep(3)
     
     try:
-        temperature_kelvin = device.environmental_state.temperature
+        # La température est en Kelvin dans environmental_state
+        temp_kelvin = getattr(device.environmental_state, "temperature", None)
         
-        if temperature_kelvin is None:
-            print("Erreur: Température non disponible")
-            dyson_account.logout()
-            return None
+        if temp_kelvin is None:
+            device.disconnect()
+            account.logout()
+            raise RuntimeError("Température non disponible")
         
-        temperature_celsius = round(temperature_kelvin - 273.15, 2)
-        print(f"Température récupérée: {temperature_celsius} °C")
+        # Conversion Kelvin → Celsius
+        temp_celsius = round(temp_kelvin - 273.15, 2)
+        
+        print(f"Température récupérée: {temp_celsius} °C")
         
         device.disconnect()
-        dyson_account.logout()
-        return temperature_celsius
+        account.logout()
+        
+        return temp_celsius
     
     except Exception as e:
-        print(f"Erreur lors de la récupération de la température: {e}")
         device.disconnect()
-        dyson_account.logout()
-        return None
+        account.logout()
+        raise RuntimeError(f"Erreur lors de la récupération de la température: {e}")
 
 
-def write_to_google_sheet(temperature):
-    """Écrire la température horodatée dans Google Sheets."""
+def write_to_sheet(temperature):
+    """
+    Écrire la température horodatée dans Google Sheets.
+    """
     print("Connexion à Google Sheets...")
     
-    scope = [
-        'https://spreadsheets.google.com/feeds',
-        'https://www.googleapis.com/auth/drive'
+    # Charger les credentials du compte de service
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
     ]
     
-    credentials_dict = os.environ['GOOGLE_CREDENTIALS_JSON']
-    creds_dict = json.loads(credentials_dict)
+    # Créer les credentials pour le compte de service
+    credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
     
-    with open('credentials.json', 'w') as f:
-        json.dump(creds_dict, f)
-    
-    credentials = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+    # Authentifier avec gspread
     client = gspread.authorize(credentials)
     
+    # Ouvrir la feuille
     sheet = client.open(GOOGLE_SHEET_NAME)
     worksheet = sheet.worksheet(WORKSHEET_NAME)
     
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    worksheet.append_row([timestamp, temperature])
+    # Créer le timestamp UTC
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    # Écrire la ligne: [timestamp, température]
+    worksheet.append_row([timestamp, temperature], value_input_option="USER_ENTERED")
     
     print(f"Donnée insérée: {timestamp} | {temperature} °C")
-    os.remove('credentials.json')
 
 
 def main():
-    """Fonction principale."""
+    """Fonction principale: récupérer la température et l'écrire dans Sheets."""
     print("=" * 50)
     print("Dyson Temperature Logger - Début de l'exécution")
     print("=" * 50)
     
-    temperature = get_dyson_temperature()
-    
-    if temperature is None:
-        print("Abandon: Température non disponible")
-        return
-    
-    try:
-        write_to_google_sheet(temperature)
-        print("Succès: Donnée insérée avec succès")
-    except Exception as e:
-        print(f"Erreur lors de l'inscription dans Google Sheets: {e}")
-        return
+    temp = get_dyson_temperature()
+    write_to_sheet(temp)
     
     print("=" * 50)
     print("Exécution terminée avec succès")
     print("=" * 50)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
