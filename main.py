@@ -5,7 +5,7 @@ et l'écrire dans Google Sheets toutes les 30 minutes.
 
 from libpurecool.dyson import DysonAccount
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.auth.service_account import ServiceAccountCredentials
 from datetime import datetime
 import os
 import time
@@ -17,8 +17,9 @@ DYSON_PASSWORD = os.environ['DYSON_PASSWORD']
 DYSON_LANGUAGE = 'FR'  # Code langue à ajuster (FR, EN, ES, etc.)
 
 # --- Configuration Google Sheets ---
-GOOGLE_SHEET_NAME = os.environ['1JGJI3FPOjseIvI-_pu9mnEWi1en0nHcl1npmr74h-tw']
-WORKSHEET_NAME = 'test'  # Nom de l'onglet (par défaut 'Feuille1')
+GOOGLE_SHEET_NAME = os.environ["GOOGLE_SHEET_NAME"]
+WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "test")
+GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 
 def get_dyson_temperature():
