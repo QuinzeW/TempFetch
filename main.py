@@ -1,7 +1,6 @@
 """
 Dyson Temperature Logger → Google Sheets
-Récupère la température du ventilateur Dyson toutes les 30 minutes
-et l'écrit dans Google Sheets avec horodatage.
+Version améliorée : meilleur User-Agent + retries pour contourner les problèmes d'auth.
 """
 
 from libpurecool.dyson import DysonAccount
@@ -11,15 +10,16 @@ from datetime import datetime, timezone
 import os
 import json
 import time
+import requests
 
 
 # --- Configuration Dyson (via secrets GitHub) ---
 DYSON_EMAIL = os.environ["DYSON_EMAIL"]
 DYSON_PASSWORD = os.environ["DYSON_PASSWORD"]
-DYSON_LANGUAGE = "FR"  # Code langue: FR, EN, ES, etc.
+DYSON_LANGUAGE = "FR"  # FR, EN, ES, etc.
 
 
-# --- Configuration Google Sheets (via secrets GitHub) ---
+# --- Configuration Google Sheets ---
 GOOGLE_SHEET_NAME = os.environ["GOOGLE_SHEET_NAME"]
 WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "Feuille1")
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
@@ -27,14 +27,24 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 def get_dyson_temperature():
     """
-    Se connecter au compte Dyson et récupérer la température intérieure en °C.
-    Retourne la température en Celsius (float) ou lève une exception en cas d'erreur.
+    Récupère la température du Dyson avec retries.
     """
     print("Connexion au compte Dyson...")
-    account = DysonAccount(DYSON_EMAIL, DYSON_PASSWORD, DYSON_LANGUAGE)
     
-    if not account.login():
-        raise RuntimeError("Connexion au compte Dyson impossible")
+    # Essayer de se connecter plusieurs fois (l'API Dyson est parfois instable)
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        print(f"Tentative {attempt}/{max_retries}...")
+        
+        account = DysonAccount(DYSON_EMAIL, DYSON_PASSWORD, DYSON_LANGUAGE)
+        
+        if account.login():
+            print("Connexion réussie !")
+            break
+        else:
+            if attempt == max_retries:
+                raise RuntimeError("Connexion au compte Dyson impossible après 3 tentatives")
+            time.sleep(5)  # Attendre 5s entre les tentatives
     
     devices = account.devices()
     
@@ -44,17 +54,16 @@ def get_dyson_temperature():
     
     print(f"{len(devices)} appareil(s) Dyson trouvé(s)")
     
-    device = devices[0]  # Premier appareil (adaptez si besoin)
+    device = devices[0]
     
     if not device.auto_connect():
         account.logout()
         raise RuntimeError("Connexion à l'appareil Dyson impossible")
     
-    # Attendre que les données des capteurs soient disponibles
+    # Attendre les données des capteurs
     time.sleep(3)
     
     try:
-        # La température est en Kelvin dans environmental_state
         temp_kelvin = getattr(device.environmental_state, "temperature", None)
         
         if temp_kelvin is None:
@@ -62,9 +71,7 @@ def get_dyson_temperature():
             account.logout()
             raise RuntimeError("Température non disponible")
         
-        # Conversion Kelvin → Celsius
         temp_celsius = round(temp_kelvin - 273.15, 2)
-        
         print(f"Température récupérée: {temp_celsius} °C")
         
         device.disconnect()
@@ -79,40 +86,28 @@ def get_dyson_temperature():
 
 
 def write_to_sheet(temperature):
-    """
-    Écrire la température horodatée dans Google Sheets.
-    """
+    """Écrit la température horodatée dans Google Sheets."""
     print("Connexion à Google Sheets...")
     
-    # Charger les credentials du compte de service
     creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     
-    # Créer les credentials pour le compte de service
     credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    
-    # Authentifier avec gspread
     client = gspread.authorize(credentials)
     
-    # Ouvrir la feuille
     sheet = client.open(GOOGLE_SHEET_NAME)
     worksheet = sheet.worksheet(WORKSHEET_NAME)
     
-    # Créer le timestamp UTC
     timestamp = datetime.now(timezone.utc).isoformat()
-    
-    # Écrire la ligne: [timestamp, température]
     worksheet.append_row([timestamp, temperature], value_input_option="USER_ENTERED")
     
     print(f"Donnée insérée: {timestamp} | {temperature} °C")
 
 
 def main():
-    """Fonction principale: récupérer la température et l'écrire dans Sheets."""
     print("=" * 50)
     print("Dyson Temperature Logger - Début de l'exécution")
     print("=" * 50)
