@@ -16,7 +16,7 @@ import requests
 # --- Configuration Dyson (via secrets GitHub) ---
 DYSON_EMAIL = os.environ["DYSON_EMAIL"]
 DYSON_PASSWORD = os.environ["DYSON_PASSWORD"]
-DYSON_LANGUAGE = "FR"  # FR, EN, ES, etc.
+DYSON_LANGUAGE = "EN"  # FR, EN, ES, etc.
 
 
 # --- Configuration Google Sheets ---
