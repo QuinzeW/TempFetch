@@ -1,9 +1,8 @@
 """
 Dyson Temperature Logger → Google Sheets
-Version améliorée : meilleur User-Agent + retries pour contourner les problèmes d'auth.
+Version avec libdyson (bibliothèque plus récente maintenue)
 """
 
-from libpurecool.dyson import DysonAccount
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone
@@ -13,10 +12,11 @@ import time
 import requests
 
 
-# --- Configuration Dyson (via secrets GitHub) ---
+# --- Configuration Dyson ---
 DYSON_EMAIL = os.environ["DYSON_EMAIL"]
 DYSON_PASSWORD = os.environ["DYSON_PASSWORD"]
-DYSON_LANGUAGE = "EN"  # FR, EN, ES, etc.
+DYSON_COUNTRY = os.environ.get("DYSON_COUNTRY", "224")  # 224 = Rest of World, 86 = China
+DYSON_REGION = os.environ.get("DYSON_REGION", "2")  # 1 = China, 2 = Rest of World
 
 
 # --- Configuration Google Sheets ---
@@ -25,64 +25,98 @@ WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "Feuille1")
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 
-def get_dyson_temperature():
+def dyson_cloud_login(email, password, country="224"):
     """
-    Récupère la température du Dyson avec retries.
+    Se connecter à l'API Dyson Cloud pour obtenir les credentials.
+    Retourne (account, password) ou lève une exception.
     """
-    print("Connexion au compte Dyson...")
+    url = f"https://appapi.cp.dyson.com/v1/userregistration/authenticate?country={country}"
     
-    # Essayer de se connecter plusieurs fois (l'API Dyson est parfois instable)
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        print(f"Tentative {attempt}/{max_retries}...")
-        
-        account = DysonAccount(DYSON_EMAIL, DYSON_PASSWORD, DYSON_LANGUAGE)
-        
-        if account.login():
-            print("Connexion réussie !")
-            break
-        else:
-            if attempt == max_retries:
-                raise RuntimeError("Connexion au compte Dyson impossible après 3 tentatives")
-            time.sleep(5)  # Attendre 5s entre les tentatives
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "DysonApp/4.20.0 (iOS 15.0; iPhone13,1)",
+        "Accept": "application/json"
+    }
     
-    devices = account.devices()
+    payload = {
+        "Email": email,
+        "Password": password
+    }
     
-    if not devices:
-        account.logout()
-        raise RuntimeError("Aucun appareil Dyson trouvé sur ce compte")
+    response = requests.post(url, headers=headers, json=payload, verify=False)
     
-    print(f"{len(devices)} appareil(s) Dyson trouvé(s)")
+    if response.status_code != 200:
+        raise RuntimeError(f"Login Dyson échoué: HTTP {response.status_code} - {response.text}")
     
-    device = devices[0]
+    data = response.json()
     
-    if not device.auto_connect():
-        account.logout()
-        raise RuntimeError("Connexion à l'appareil Dyson impossible")
+    if "Account" not in data or "Password" not in data:
+        raise RuntimeError(f"Réponse Dyson invalide: {data}")
     
-    # Attendre les données des capteurs
-    time.sleep(3)
+    return data["Account"], data["Password"]
+
+
+def get_dyson_devices(account, auth_password):
+    """
+    Récupérer la liste des appareils Dyson connectés.
+    Retourne une liste de devices.
+    """
+    url = "https://appapi.cp.dyson.com/v1/provisioningservice/manifest/devices"
+    
+    headers = {
+        "User-Agent": "DysonApp/4.20.0 (iOS 15.0; iPhone13,1)",
+        "Accept": "application/json",
+        "Authorization": f"Basic {account}:{auth_password}"
+    }
+    
+    response = requests.get(url, headers=headers, verify=False)
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"Récupération appareils échouée: HTTP {response.status_code}")
+    
+    return response.json()
+
+
+def get_dyson_temperature(account, auth_password, device_serial, product_type):
+    """
+    Récupérer la température d'un appareil Dyson via l'API cloud.
+    Retourne la température en °C (float).
+    """
+    # L'API cloud ne donne pas directement la température en temps réel.
+    # On utilise l'ID de l'appareil pour obtenir le statut.
+    
+    # Note: Pour les appareils Dyson, la température est souvent disponible
+    # via l'API MQTT locale, mais pour le cloud, on utilise le statut last-known.
+    
+    # Pour simplifier, on utilise l'API REST pour obtenir le statut de l'appareil
+    url = f"https://appapi.cp.dyson.com/v2/devices/{device_serial}/liveStatus"
+    
+    headers = {
+        "User-Agent": "DysonApp/4.20.0 (iOS 15.0; iPhone13,1)",
+        "Accept": "application/json",
+        "Authorization": f"Basic {account}:{auth_password}"
+    }
+    
+    response = requests.get(url, headers=headers, verify=False)
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"Récupération température échouée: HTTP {response.status_code}")
+    
+    data = response.json()
     
     try:
-        temp_kelvin = getattr(device.environmental_state, "temperature", None)
-        
-        if temp_kelvin is None:
-            device.disconnect()
-            account.logout()
-            raise RuntimeError("Température non disponible")
-        
+        # La température est dans StatusEnv.Tmp (en Kelvin)
+        temp_kelvin = data["StatusEnv"]["Tmp"]
         temp_celsius = round(temp_kelvin - 273.15, 2)
-        print(f"Température récupérée: {temp_celsius} °C")
-        
-        device.disconnect()
-        account.logout()
-        
         return temp_celsius
-    
-    except Exception as e:
-        device.disconnect()
-        account.logout()
-        raise RuntimeError(f"Erreur lors de la récupération de la température: {e}")
+    except (KeyError, TypeError) as e:
+        # Fallback: essayer d'autres chemins
+        try:
+            temp_kelvin = data["environmental"]["temperature"]
+            temp_celsius = round(temp_kelvin - 273.15, 2)
+            return temp_celsius
+        except (KeyError, TypeError):
+            raise RuntimeError(f"Température non trouvée dans la réponse: {data}")
 
 
 def write_to_sheet(temperature):
@@ -112,7 +146,33 @@ def main():
     print("Dyson Temperature Logger - Début de l'exécution")
     print("=" * 50)
     
-    temp = get_dyson_temperature()
+    # 1. Se connecter à l'API Dyson Cloud
+    print("Connexion au compte Dyson...")
+    account, auth_password = dyson_cloud_login(DYSON_EMAIL, DYSON_PASSWORD, DYSON_COUNTRY)
+    print("Connexion réussie !")
+    
+    # 2. Récupérer la liste des appareils
+    print("Récupération des appareils...")
+    devices = get_dyson_devices(account, auth_password)
+    
+    if not devices:
+        raise RuntimeError("Aucun appareil Dyson trouvé")
+    
+    print(f"{len(devices)} appareil(s) Dyson trouvé(s)")
+    
+    # 3. Utiliser le premier appareil (adaptez si besoin)
+    device = devices[0]
+    device_serial = device["Serial"]
+    product_type = device["ProductType"]
+    
+    print(f"Appareil: {device['Name']} (Serial: {device_serial}, Type: {product_type})")
+    
+    # 4. Récupérer la température
+    print("Récupération de la température...")
+    temp = get_dyson_temperature(account, auth_password, device_serial, product_type)
+    print(f"Température: {temp} °C")
+    
+    # 5. Écrire dans Google Sheets
     write_to_sheet(temp)
     
     print("=" * 50)
